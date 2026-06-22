@@ -35,9 +35,8 @@ pub(crate) struct Peer {
     pub(crate) guid: Vec<u8>,
     pub(crate) uuid: Bytes,
     pub(crate) pk: Bytes,
-    // pub(crate) user: Option<Vec<u8>>,
     pub(crate) info: PeerInfo,
-    // pub(crate) disabled: bool,
+    pub(crate) disabled: bool,
     pub(crate) reg_pk: (u32, Instant), // how often register_pk
 }
 
@@ -50,8 +49,7 @@ impl Default for Peer {
             uuid: Bytes::new(),
             pk: Bytes::new(),
             info: Default::default(),
-            // user: None,
-            // disabled: false,
+            disabled: false,
             reg_pk: (0, get_expired_time()),
         }
     }
@@ -118,8 +116,9 @@ impl PeerMap {
                     log::error!("db.insert_peer failed: {}", err);
                     return register_pk_response::Result::SERVER_ERROR;
                 }
-                Ok(guid) => {
-                    peer.write().await.guid = guid;
+                Ok(new_guid) => {
+                    let _ = self.db.update_last_online(&new_guid).await;
+                    peer.write().await.guid = new_guid;
                 }
             }
         } else {
@@ -127,6 +126,7 @@ impl PeerMap {
                 log::error!("db.update_pk failed: {}", err);
                 return register_pk_response::Result::SERVER_ERROR;
             }
+            let _ = self.db.update_last_online(&guid).await;
             log::info!("pk updated instead of insert");
         }
         register_pk_response::Result::OK
@@ -142,9 +142,8 @@ impl PeerMap {
                 guid: v.guid,
                 uuid: v.uuid.into(),
                 pk: v.pk.into(),
-                // user: v.user,
                 info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
-                // disabled: v.status == Some(0),
+                disabled: v.status == Some(0),
                 ..Default::default()
             };
             let peer = Arc::new(RwLock::new(peer));
@@ -176,5 +175,27 @@ impl PeerMap {
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+
+    // Evict peer from in-memory cache so that the next access reloads from DB.
+    // Call this after changing peer status in DB (disable/enable).
+    pub(crate) async fn evict(&self, id: &str) {
+        self.map.write().await.remove(id);
+    }
+
+    // Returns the set of peer IDs that are currently online (recently heartbeated).
+    pub(crate) async fn get_online_set(&self) -> HashSet<String> {
+        const REG_TIMEOUT_MS: u128 = 30_000;
+        let peers: Vec<(String, LockPeer)> = {
+            let map = self.map.read().await;
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        let mut online = HashSet::new();
+        for (id, peer) in peers {
+            if peer.read().await.last_reg_time.elapsed().as_millis() < REG_TIMEOUT_MS {
+                online.insert(id);
+            }
+        }
+        online
     }
 }
