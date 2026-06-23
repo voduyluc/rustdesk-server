@@ -1,0 +1,460 @@
+#!/bin/bash
+
+# =============================================================================
+# RustDesk Server - Build & Install from source
+# Repo: https://github.com/voduyluc/rustdesk-server
+# Khác script gốc: clone repo rồi build trực tiếp thay vì download zip.
+# Bao gồm Management API (whitelist, disable/enable peer).
+# =============================================================================
+
+# --- Cấu hình ----------------------------------------------------------------
+REPO_URL="https://github.com/voduyluc/rustdesk-server"
+REPO_BRANCH="claude/client-id-source-management-5vi87b"
+INSTALL_DIR="/opt/rustdesk"
+BUILD_DIR="/opt/rustdesk-server-src"
+# Port Management API (mặc định = main_port + 3 = 21119)
+API_PORT="21119"
+# API key để bảo vệ Management API (để trống = không cần auth)
+API_KEY=""
+# Bật whitelist (Y = chỉ ID trong whitelist mới kết nối được)
+ENABLE_WHITELIST="N"
+# -----------------------------------------------------------------------------
+
+# Get user options
+while getopts i:-: option; do
+    case "${option}" in
+        -)
+            case "${OPTARG}" in
+                help)
+                    help="true";;
+                resolveip)
+                    resolveip="true";;
+                resolvedns)
+                    val="${!OPTIND}"; OPTIND=$(( $OPTIND + 1 ))
+                    resolvedns=${val};;
+                install-http)
+                    http="true";;
+                skip-http)
+                    http="false";;
+                no-sudo)
+                    usesudo="false";;
+                branch)
+                    val="${!OPTIND}"; OPTIND=$(( $OPTIND + 1 ))
+                    REPO_BRANCH=${val};;
+            esac;;
+        i) resolveip="true";;
+    esac
+done
+
+function displayhelp() {
+    if [[ ! -z $help ]]; then
+        echo 'usage: install.sh [options]'
+        echo "options:"
+        echo "--resolveip              Use WAN IP for server name."
+        echo '--resolvedns "fqdn"      Use FQDN for server name.'
+        echo "--install-http           Install HTTP server to host client install scripts."
+        echo "--skip-http              Skip HTTP server installation."
+        echo "--no-sudo                Do not use sudo."
+        echo '--branch "name"          Git branch to build (default: claude/client-id-source-management-5vi87b)'
+        exit 0
+    fi
+}
+displayhelp
+
+# Sudo detection
+usesudo="${usesudo:-true}"
+if [[ "$usesudo" == "true" ]]; then
+    if command -v sudo &>/dev/null; then
+        SUDO="sudo"
+        echo "sudo detected and will be used."
+    else
+        echo "sudo not found. Switching to no-sudo mode."
+        SUDO=""
+    fi
+else
+    SUDO=""
+    echo "Running in no-sudo mode."
+fi
+
+# User info
+uname=$(whoami)
+gname=$(id -gn ${uname})
+admintoken=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c16)
+
+ARCH=$(uname -m)
+
+# OS detection
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$NAME
+    VER=$VERSION_ID
+    UPSTREAM_ID=${ID_LIKE,,}
+    if [ "${UPSTREAM_ID}" != "debian" ] && [ "${UPSTREAM_ID}" != "ubuntu" ]; then
+        UPSTREAM_ID="$(echo ${ID_LIKE,,} | sed s/\"//g | cut -d' ' -f1)"
+    fi
+elif type lsb_release >/dev/null 2>&1; then
+    OS=$(lsb_release -si)
+    VER=$(lsb_release -sr)
+elif [ -f /etc/lsb-release ]; then
+    . /etc/lsb-release
+    OS=$DISTRIB_ID
+    VER=$DISTRIB_RELEASE
+elif [ -f /etc/debian_version ]; then
+    OS=Debian
+    VER=$(cat /etc/debian_version)
+elif [ -f /etc/redhat-release ]; then
+    OS=RedHat
+    VER=$(cat /etc/redhat-release)
+else
+    OS=$(uname -s)
+    VER=$(uname -r)
+fi
+
+if [ "$DEBUG" = "true" ]; then
+    echo "OS: $OS"
+    echo "VER: $VER"
+    echo "UPSTREAM_ID: $UPSTREAM_ID"
+    exit 0
+fi
+
+# Prerequisites (build tools thay vì unzip)
+PREREQ="curl wget tar git gcc make pkg-config"
+PREREQDEB="dnsutils build-essential libssl-dev libsodium-dev"
+PREREQRPM="bind-utils openssl-devel libsodium-devel"
+PREREQARCH="bind libsodium base-devel"
+
+echo "Installing prerequisites"
+if [ "${ID}" = "debian" ] || [ "$OS" = "Ubuntu" ] || [ "$OS" = "Debian" ] || \
+   [ "${UPSTREAM_ID}" = "ubuntu" ] || [ "${UPSTREAM_ID}" = "debian" ]; then
+    $SUDO apt-get update
+    $SUDO apt-get install -y ${PREREQ} ${PREREQDEB}
+elif [ "$OS" = "CentOS" ] || [ "$OS" = "RedHat" ] || [ "${UPSTREAM_ID}" = "rhel" ]; then
+    $SUDO yum update -y
+    $SUDO yum groupinstall -y "Development Tools"
+    $SUDO yum install -y ${PREREQ} ${PREREQRPM}
+elif [ "${ID}" = "arch" ] || [ "${UPSTREAM_ID}" = "arch" ]; then
+    $SUDO pacman -Syu
+    $SUDO pacman -S --needed ${PREREQ} ${PREREQARCH}
+else
+    echo "Unsupported OS"
+    echo -n "Would you like to continue? Dependencies may not be satisfied... [y/n] "
+    read continue_no_dependencies
+    if [ $continue_no_dependencies == "y" ]; then
+        echo "Continuing..."
+    elif [ $continue_no_dependencies != "n" ]; then
+        echo "Invalid answer, exiting."
+        exit 1
+    else
+        exit 1
+    fi
+fi
+
+# Install Rust toolchain nếu chưa có
+if ! command -v cargo &>/dev/null; then
+    echo "Installing Rust toolchain via rustup..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    # Load cargo vào PATH cho phiên hiện tại
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+else
+    echo "Rust/cargo already installed: $(cargo --version)"
+    # Đảm bảo cargo nằm trong PATH
+    source "$HOME/.cargo/env" 2>/dev/null || true
+fi
+
+# Choice for DNS or IP
+if [[ -z "$resolveip" && -z "$resolvedns" ]]; then
+    PS3='Choose your preferred connection method: auto-resolve current WAN IP or enter your DNS/Domain:'
+    WAN=("IP" "DNS/Domain")
+    select WANOPT in "${WAN[@]}"; do
+    case $WANOPT in
+    "IP")
+    wanip=$(dig @resolver4.opendns.com myip.opendns.com +short)
+    break
+    ;;
+    "DNS/Domain")
+    echo -ne "Enter your preferred domain/dns address: "
+    read wanip
+    if ! [[ $wanip =~ ^[a-zA-Z0-9]+([a-zA-Z0-9.-]*[a-zA-Z0-9]+)?$ ]]; then
+        echo "Invalid domain/dns address"
+        exit 1
+    fi
+    break
+    ;;
+    *) echo "invalid option $REPLY";;
+    esac
+    done
+elif [[ ! -z "$resolveip" && ! -z "$resolvedns" ]]; then
+    echo "ERROR: Cannot use both --resolveip and --resolvedns simultaneously"
+    exit 1
+elif [[ ! -z "$resolveip" && -z "$resolvedns" ]]; then
+    wanip=$(dig @resolver4.opendns.com myip.opendns.com +short)
+elif [[ -z "$resolveip" && ! -z "$resolvedns" ]]; then
+    wanip="$resolvedns"
+    if ! [[ $wanip =~ ^[a-zA-Z0-9]+([a-zA-Z0-9.-]*[a-zA-Z0-9]+)?$ ]]; then
+        echo "Invalid domain/dns address"
+        exit 1
+    fi
+fi
+
+# ── Clone / update source repository ─────────────────────────────────────────
+echo ""
+echo "==> Cloning ${REPO_URL} (branch: ${REPO_BRANCH})..."
+if [ -d "${BUILD_DIR}/.git" ]; then
+    echo "Source already exists at ${BUILD_DIR}, pulling latest changes..."
+    cd "${BUILD_DIR}" || exit 1
+    git fetch origin
+    git checkout "${REPO_BRANCH}"
+    git pull origin "${REPO_BRANCH}"
+else
+    $SUDO mkdir -p "${BUILD_DIR}"
+    $SUDO chown "${uname}" -R "${BUILD_DIR}"
+    git clone --branch "${REPO_BRANCH}" --depth 1 "${REPO_URL}" "${BUILD_DIR}"
+    cd "${BUILD_DIR}" || exit 1
+fi
+
+# ── Build binaries ────────────────────────────────────────────────────────────
+echo ""
+echo "==> Building RustDesk server (có thể mất vài phút)..."
+cargo build --release --bin hbbs --bin hbbr
+echo "Build hoàn tất."
+
+# ── Copy binaries vào install dir ─────────────────────────────────────────────
+if [ ! -d "${INSTALL_DIR}" ]; then
+    echo "Creating ${INSTALL_DIR}"
+    $SUDO mkdir -p "${INSTALL_DIR}"
+fi
+$SUDO chown "${uname}" -R "${INSTALL_DIR}"
+
+cp "${BUILD_DIR}/target/release/hbbs" "${INSTALL_DIR}/hbbs"
+cp "${BUILD_DIR}/target/release/hbbr" "${INSTALL_DIR}/hbbr"
+chmod +x "${INSTALL_DIR}/hbbs"
+chmod +x "${INSTALL_DIR}/hbbr"
+
+# Log directory
+if [ ! -d "/var/log/rustdesk" ]; then
+    echo "Creating /var/log/rustdesk"
+    $SUDO mkdir -p /var/log/rustdesk/
+fi
+$SUDO chown "${uname}" -R /var/log/rustdesk/
+
+# ── Systemd: hbbs (Signal/Rendezvous Server) ──────────────────────────────────
+rustdesksignal="$(cat << EOF
+[Unit]
+Description=Rustdesk Signal Server
+After=network.target
+
+[Service]
+Type=simple
+LimitNOFILE=1000000
+ExecStart=${INSTALL_DIR}/hbbs
+WorkingDirectory=${INSTALL_DIR}/
+Environment=API_PORT=${API_PORT}
+Environment=API_KEY=${API_KEY}
+Environment=ENABLE_WHITELIST=${ENABLE_WHITELIST}
+User=${uname}
+Group=${gname}
+Restart=always
+StandardOutput=append:/var/log/rustdesk/signalserver.log
+StandardError=append:/var/log/rustdesk/signalserver.error
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)"
+echo "${rustdesksignal}" | $SUDO tee /etc/systemd/system/rustdesksignal.service > /dev/null
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable rustdesksignal.service
+$SUDO systemctl start rustdesksignal.service
+
+# ── Systemd: hbbr (Relay Server) ──────────────────────────────────────────────
+rustdeskrelay="$(cat << EOF
+[Unit]
+Description=Rustdesk Relay Server
+After=network.target
+
+[Service]
+Type=simple
+LimitNOFILE=1000000
+ExecStart=${INSTALL_DIR}/hbbr
+WorkingDirectory=${INSTALL_DIR}/
+User=${uname}
+Group=${gname}
+Restart=always
+StandardOutput=append:/var/log/rustdesk/relayserver.log
+StandardError=append:/var/log/rustdesk/relayserver.error
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)"
+echo "${rustdeskrelay}" | $SUDO tee /etc/systemd/system/rustdeskrelay.service > /dev/null
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable rustdeskrelay.service
+$SUDO systemctl start rustdeskrelay.service
+
+while ! [[ $CHECK_RUSTDESK_READY ]]; do
+  CHECK_RUSTDESK_READY=$($SUDO systemctl status rustdeskrelay.service | grep "Active: active (running)")
+  echo -ne "Rustdesk Relay not ready yet...\n"
+  sleep 3
+done
+
+pubname=$(find "${INSTALL_DIR}" -name "*.pub")
+key=$(cat "${pubname}")
+
+echo "Grabbing installers"
+string="{\"host\":\"${wanip}\",\"relay\":\"${wanip}\",\"key\":\"${key}\",\"api\":\"https://${wanip}\"}"
+string64=$(echo -n "$string" | base64 -w 0 | tr -d '=')
+string64rev=$(echo -n "$string64" | rev)
+
+echo "$string64rev"
+
+function setuphttp () {
+    # Tải script cài đặt client
+    cd /tmp || exit 1
+    wget https://raw.githubusercontent.com/techahold/rustdeskinstall/master/WindowsAgentAIOInstall.ps1
+    $SUDO sed -i "s|secure-string|${string64rev}|g" WindowsAgentAIOInstall.ps1
+
+    wget https://raw.githubusercontent.com/techahold/rustdeskinstall/master/linuxclientinstall.sh
+    $SUDO sed -i "s|secure-string|${string64rev}|g" linuxclientinstall.sh
+
+    # GoHTTPServer
+    if [ ! -d "/opt/gohttp" ]; then
+        echo "Creating /opt/gohttp"
+        $SUDO mkdir -p /opt/gohttp/
+        $SUDO mkdir -p /opt/gohttp/public
+    fi
+    $SUDO chown "${uname}" -R /opt/gohttp
+    cd /opt/gohttp || exit 1
+    GOHTTPLATEST=$(curl https://api.github.com/repos/codeskyblue/gohttpserver/releases/latest -s | grep "tag_name" | awk '{print substr($2, 2, length($2)-3) }')
+
+    echo "Installing Go HTTP Server"
+    if [ "${ARCH}" = "x86_64" ]; then
+        wget "https://github.com/codeskyblue/gohttpserver/releases/download/${GOHTTPLATEST}/gohttpserver_${GOHTTPLATEST}_linux_amd64.tar.gz"
+        tar -xf "gohttpserver_${GOHTTPLATEST}_linux_amd64.tar.gz"
+    elif [ "${ARCH}" = "aarch64" ]; then
+        wget "https://github.com/codeskyblue/gohttpserver/releases/download/${GOHTTPLATEST}/gohttpserver_${GOHTTPLATEST}_linux_arm64.tar.gz"
+        tar -xf "gohttpserver_${GOHTTPLATEST}_linux_arm64.tar.gz"
+    elif [ "${ARCH}" = "armv7l" ]; then
+        echo "Go HTTP Server không hỗ trợ 32-bit ARM"
+        echo "IP/DNS: ${wanip}"
+        echo "Public key: ${key}"
+        exit 1
+    fi
+
+    # Copy install scripts
+    mv /tmp/WindowsAgentAIOInstall.ps1 /opt/gohttp/public/
+    mv /tmp/linuxclientinstall.sh /opt/gohttp/public/
+
+    # Log folder cho gohttp
+    if [ ! -d "/var/log/gohttp" ]; then
+        echo "Creating /var/log/gohttp"
+        $SUDO mkdir -p /var/log/gohttp/
+    fi
+    $SUDO chown "${uname}" -R /var/log/gohttp/
+
+    echo "Tidying up Go HTTP Server Install"
+    if [ "${ARCH}" = "x86_64" ]; then
+        rm "gohttpserver_${GOHTTPLATEST}_linux_amd64.tar.gz"
+    elif [ "${ARCH}" = "armv7l" ] || [ "${ARCH}" = "aarch64" ]; then
+        rm "gohttpserver_${GOHTTPLATEST}_linux_arm64.tar.gz"
+    fi
+
+    # Systemd cho GoHTTPServer
+    gohttpserver="$(cat << EOF
+[Unit]
+Description=Go HTTP Server
+[Service]
+Type=simple
+LimitNOFILE=1000000
+ExecStart=/opt/gohttp/gohttpserver -r ./public --port 8000 --auth-type http --auth-http admin:${admintoken}
+WorkingDirectory=/opt/gohttp/
+User=${uname}
+Group=${gname}
+Restart=always
+StandardOutput=append:/var/log/gohttp/gohttpserver.log
+StandardError=append:/var/log/gohttp/gohttpserver.error
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
+EOF
+)"
+    echo "${gohttpserver}" | $SUDO tee /etc/systemd/system/gohttpserver.service > /dev/null
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable gohttpserver.service
+    $SUDO systemctl start gohttpserver.service
+
+    echo ""
+    echo "================================================================"
+    echo "  Cài đặt hoàn tất!"
+    echo "================================================================"
+    echo "  IP/DNS:         ${wanip}"
+    echo "  Public key:     ${key}"
+    echo "  Client scripts: http://${wanip}:8000  (admin / ${admintoken})"
+    echo ""
+    echo "  Management API: http://${wanip}:${API_PORT}"
+    echo "    GET  /api/peers              - Danh sách peers (online/offline)"
+    echo "    POST /api/peers/:id/disable  - Vô hiệu hóa peer"
+    echo "    POST /api/peers/:id/enable   - Kích hoạt peer"
+    echo "    GET  /api/whitelist          - Danh sách whitelist"
+    echo "    POST /api/whitelist          - Thêm ID vào whitelist"
+    echo "    DELETE /api/whitelist/:id    - Xóa khỏi whitelist"
+    if [ -n "${API_KEY}" ]; then
+        echo "    Header: X-Api-Key: ${API_KEY}"
+    else
+        echo "    (Chưa đặt API_KEY - API hiện chưa có xác thực)"
+        echo "    Chỉnh API_KEY trong /etc/systemd/system/rustdesksignal.service"
+    fi
+    echo "================================================================"
+}
+
+# Lựa chọn HTTP server
+if [[ -z "$http" ]]; then
+    PS3='Cài HTTP server để host client install scripts không? '
+    EXTRA=("Yes" "No")
+    select EXTRAOPT in "${EXTRA[@]}"; do
+    case $EXTRAOPT in
+    "Yes")
+    setuphttp
+    break
+    ;;
+    "No")
+    echo ""
+    echo "================================================================"
+    echo "  Cài đặt hoàn tất!"
+    echo "================================================================"
+    echo "  IP/DNS:     ${wanip}"
+    echo "  Public key: ${key}"
+    echo ""
+    echo "  Management API: http://${wanip}:${API_PORT}"
+    if [ -n "${API_KEY}" ]; then
+        echo "  Header: X-Api-Key: ${API_KEY}"
+    else
+        echo "  (Chưa đặt API_KEY - API hiện chưa có xác thực)"
+    fi
+    echo "================================================================"
+    break
+    ;;
+    *) echo "invalid option $REPLY";;
+    esac
+    done
+elif [ "$http" = "true" ]; then
+    setuphttp
+elif [ "$http" = "false" ]; then
+    echo ""
+    echo "================================================================"
+    echo "  Cài đặt hoàn tất!"
+    echo "================================================================"
+    echo "  IP/DNS:     ${wanip}"
+    echo "  Public key: ${key}"
+    echo ""
+    echo "  Management API: http://${wanip}:${API_PORT}"
+    if [ -n "${API_KEY}" ]; then
+        echo "  Header: X-Api-Key: ${API_KEY}"
+    else
+        echo "  (Chưa đặt API_KEY - API hiện chưa có xác thực)"
+    fi
+    echo "================================================================"
+fi
