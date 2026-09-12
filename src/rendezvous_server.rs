@@ -147,6 +147,18 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+
+        // Management API server
+        {
+            let api_port = std::env::var("API_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or((port + 3) as u16);
+            let pm_for_api = rs.pm.clone();
+            tokio::spawn(async move {
+                crate::api::start(pm_for_api, api_port).await;
+            });
+        }
         let mut listener = create_tcp_listener(port).await?;
         let mut listener2 = create_tcp_listener(nat_port).await?;
         let mut listener3 = create_tcp_listener(ws_port).await?;
@@ -350,7 +362,33 @@ impl RendezvousServer {
                     } else if !self.check_ip_blocker(&ip, &id).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
                     }
+
+                    // Whitelist enforcement (opt-in via ENABLE_WHITELIST=Y)
+                    if std::env::var("ENABLE_WHITELIST")
+                        .unwrap_or_default()
+                        .to_uppercase()
+                        == "Y"
+                    {
+                        match self.pm.db.is_in_whitelist(&id).await {
+                            Ok(false) => {
+                                log::warn!("RegisterPk rejected: {} not in whitelist", id);
+                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                            }
+                            Err(e) => {
+                                log::error!("Whitelist check error: {}", e);
+                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     let peer = self.pm.get_or(&id).await;
+
+                    // Disabled check
+                    if peer.read().await.disabled {
+                        log::warn!("RegisterPk rejected: {} is disabled", id);
+                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                    }
                     let (changed, ip_changed) = {
                         let peer = peer.read().await;
                         if peer.uuid.is_empty() {

@@ -1,0 +1,546 @@
+From a9c8c0f3cdf312641b3d8b95d144daa9b4f1b08d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 22 Jun 2026 15:59:47 +0000
+Subject: [PATCH 1/2] feat: add client ID management with whitelist,
+ disable/enable, and REST API
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Whitelist table: only allow pre-approved IDs to register when ENABLE_WHITELIST=Y
+- Peer disable/enable: use existing status column (0=disabled, 1=active)
+- last_online tracking: updated in DB on every successful RegisterPk
+- Online status: derived from in-memory last_reg_time (< 30s = online)
+- Management REST API on port API_PORT (default: main_port+3, e.g. 21119)
+  - GET  /api/peers              — list all peers with online/offline/disabled/last_online
+  - POST /api/peers/:id/disable  — disable a peer
+  - POST /api/peers/:id/enable   — enable a peer
+  - GET  /api/whitelist          — list whitelist
+  - POST /api/whitelist          — add ID to whitelist
+  - DELETE /api/whitelist/:id    — remove ID from whitelist
+- Auth: X-Api-Key header (set via API_KEY env var; empty = no auth)
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EvMxReWsyLxKvxRd6ksktn
+---
+ src/api.rs               | 237 +++++++++++++++++++++++++++++++++++++++
+ src/database.rs          |  93 +++++++++++++++
+ src/lib.rs               |   1 +
+ src/peer.rs              |  37 ++++--
+ src/rendezvous_server.rs |  38 +++++++
+ 5 files changed, 398 insertions(+), 8 deletions(-)
+ create mode 100644 src/api.rs
+
+diff --git a/src/api.rs b/src/api.rs
+new file mode 100644
+index 0000000..8225dbe
+--- /dev/null
++++ b/src/api.rs
+@@ -0,0 +1,237 @@
++use crate::peer::PeerMap;
++use axum::{
++    extract::{Extension, Path},
++    http::{HeaderMap, StatusCode},
++    response::{IntoResponse, Json},
++    routing::{delete, get, post},
++    Router,
++};
++use hbb_common::log;
++use serde::{Deserialize, Serialize};
++use std::net::SocketAddr;
++
++#[derive(Clone)]
++struct ApiState {
++    pm: PeerMap,
++    api_key: String,
++}
++
++fn check_auth(headers: &HeaderMap, api_key: &str) -> bool {
++    if api_key.is_empty() {
++        return true;
++    }
++    headers
++        .get("x-api-key")
++        .and_then(|v| v.to_str().ok())
++        .map(|v| v == api_key)
++        .unwrap_or(false)
++}
++
++// ── Response types ─────────────────────────────────────────────────────────
++
++#[derive(Serialize)]
++struct PeerResponse {
++    id: String,
++    online: bool,
++    disabled: bool,
++    last_online: Option<String>,
++    created_at: Option<String>,
++    ip: String,
++    note: Option<String>,
++}
++
++#[derive(Serialize)]
++struct WhitelistResponse {
++    id: String,
++    note: Option<String>,
++    created_at: Option<String>,
++}
++
++#[derive(Serialize)]
++struct ApiError {
++    error: String,
++}
++
++#[derive(Deserialize)]
++struct AddWhitelistBody {
++    id: String,
++    #[serde(default)]
++    note: String,
++}
++
++// ── Helpers ────────────────────────────────────────────────────────────────
++
++fn unauthorized() -> impl IntoResponse {
++    (
++        StatusCode::UNAUTHORIZED,
++        Json(ApiError {
++            error: "Unauthorized".into(),
++        }),
++    )
++}
++
++fn bad_request(msg: impl Into<String>) -> impl IntoResponse {
++    (
++        StatusCode::BAD_REQUEST,
++        Json(ApiError { error: msg.into() }),
++    )
++}
++
++fn internal_error(msg: impl Into<String>) -> impl IntoResponse {
++    (
++        StatusCode::INTERNAL_SERVER_ERROR,
++        Json(ApiError { error: msg.into() }),
++    )
++}
++
++// ── Handlers ───────────────────────────────────────────────────────────────
++
++async fn list_peers(
++    Extension(state): Extension<ApiState>,
++    headers: HeaderMap,
++) -> impl IntoResponse {
++    if !check_auth(&headers, &state.api_key) {
++        return unauthorized().into_response();
++    }
++    let records = match state.pm.db.list_peers().await {
++        Ok(r) => r,
++        Err(e) => return internal_error(e.to_string()).into_response(),
++    };
++    let online_set = state.pm.get_online_set().await;
++    let peers: Vec<PeerResponse> = records
++        .into_iter()
++        .map(|r| {
++            let online = online_set.contains(&r.id);
++            let ip = serde_json::from_str::<serde_json::Value>(&r.info)
++                .ok()
++                .and_then(|v| v.get("ip").and_then(|ip| ip.as_str()).map(String::from))
++                .unwrap_or_default();
++            PeerResponse {
++                disabled: r.status == Some(0),
++                id: r.id,
++                online,
++                last_online: r.last_online,
++                created_at: r.created_at,
++                ip,
++                note: r.note,
++            }
++        })
++        .collect();
++    Json(peers).into_response()
++}
++
++async fn disable_peer(
++    Extension(state): Extension<ApiState>,
++    headers: HeaderMap,
++    Path(id): Path<String>,
++) -> impl IntoResponse {
++    if !check_auth(&headers, &state.api_key) {
++        return unauthorized().into_response();
++    }
++    if let Err(e) = state.pm.db.set_peer_status(&id, 0).await {
++        return internal_error(e.to_string()).into_response();
++    }
++    state.pm.evict(&id).await;
++    log::info!("Peer {} disabled via API", id);
++    Json(serde_json::json!({"ok": true})).into_response()
++}
++
++async fn enable_peer(
++    Extension(state): Extension<ApiState>,
++    headers: HeaderMap,
++    Path(id): Path<String>,
++) -> impl IntoResponse {
++    if !check_auth(&headers, &state.api_key) {
++        return unauthorized().into_response();
++    }
++    if let Err(e) = state.pm.db.set_peer_status(&id, 1).await {
++        return internal_error(e.to_string()).into_response();
++    }
++    state.pm.evict(&id).await;
++    log::info!("Peer {} enabled via API", id);
++    Json(serde_json::json!({"ok": true})).into_response()
++}
++
++async fn list_whitelist(
++    Extension(state): Extension<ApiState>,
++    headers: HeaderMap,
++) -> impl IntoResponse {
++    if !check_auth(&headers, &state.api_key) {
++        return unauthorized().into_response();
++    }
++    match state.pm.db.list_whitelist().await {
++        Ok(entries) => {
++            let resp: Vec<WhitelistResponse> = entries
++                .into_iter()
++                .map(|e| WhitelistResponse {
++                    id: e.id,
++                    note: e.note,
++                    created_at: e.created_at,
++                })
++                .collect();
++            Json(resp).into_response()
++        }
++        Err(e) => internal_error(e.to_string()).into_response(),
++    }
++}
++
++async fn add_whitelist(
++    Extension(state): Extension<ApiState>,
++    headers: HeaderMap,
++    Json(body): Json<AddWhitelistBody>,
++) -> impl IntoResponse {
++    if !check_auth(&headers, &state.api_key) {
++        return unauthorized().into_response();
++    }
++    if body.id.len() < 6 {
++        return bad_request("ID must be at least 6 characters").into_response();
++    }
++    if let Err(e) = state.pm.db.add_to_whitelist(&body.id, &body.note).await {
++        return internal_error(e.to_string()).into_response();
++    }
++    log::info!("Whitelist: added {}", body.id);
++    Json(serde_json::json!({"ok": true})).into_response()
++}
++
++async fn remove_whitelist(
++    Extension(state): Extension<ApiState>,
++    headers: HeaderMap,
++    Path(id): Path<String>,
++) -> impl IntoResponse {
++    if !check_auth(&headers, &state.api_key) {
++        return unauthorized().into_response();
++    }
++    if let Err(e) = state.pm.db.remove_from_whitelist(&id).await {
++        return internal_error(e.to_string()).into_response();
++    }
++    log::info!("Whitelist: removed {}", id);
++    Json(serde_json::json!({"ok": true})).into_response()
++}
++
++// ── Server startup ─────────────────────────────────────────────────────────
++
++pub(crate) async fn start(pm: PeerMap, port: u16) {
++    let api_key = std::env::var("API_KEY").unwrap_or_default();
++    if api_key.is_empty() {
++        log::warn!("API_KEY is not set — management API is open to anyone");
++    }
++    let state = ApiState { pm, api_key };
++
++    let app = Router::new()
++        .route("/api/peers", get(list_peers))
++        .route("/api/peers/:id/disable", post(disable_peer))
++        .route("/api/peers/:id/enable", post(enable_peer))
++        .route("/api/whitelist", get(list_whitelist))
++        .route("/api/whitelist", post(add_whitelist))
++        .route("/api/whitelist/:id", delete(remove_whitelist))
++        .layer(Extension(state));
++
++    let addr = SocketAddr::from(([0, 0, 0, 0], port));
++    log::info!("Management API listening on :{}", port);
++    if let Err(e) = axum::Server::bind(&addr)
++        .serve(app.into_make_service())
++        .await
++    {
++        log::error!("Management API server error: {}", e);
++    }
++}
+diff --git a/src/database.rs b/src/database.rs
+index fa1b6ed..c67d22f 100644
+--- a/src/database.rs
++++ b/src/database.rs
+@@ -4,6 +4,23 @@ use sqlx::{
+     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
+ };
+ use std::{ops::DerefMut, str::FromStr};
++
++#[derive(Default, sqlx::FromRow)]
++pub struct WhitelistEntry {
++    pub id: String,
++    pub note: Option<String>,
++    pub created_at: Option<String>,
++}
++
++#[derive(Default, sqlx::FromRow)]
++pub struct PeerListRecord {
++    pub id: String,
++    pub status: Option<i64>,
++    pub note: Option<String>,
++    pub created_at: Option<String>,
++    pub last_online: Option<String>,
++    pub info: String,
++}
+ //use sqlx::postgres::PgPoolOptions;
+ //use sqlx::mysql::MySqlPoolOptions;
+ 
+@@ -90,6 +107,23 @@ impl Database {
+         )
+         .execute(self.pool.get().await?.deref_mut())
+         .await?;
++
++        // Migrate: add last_online column if not already present
++        let _ = sqlx::query("ALTER TABLE peer ADD COLUMN last_online DATETIME")
++            .execute(self.pool.get().await?.deref_mut())
++            .await;
++
++        // Whitelist table
++        sqlx::query(
++            "CREATE TABLE IF NOT EXISTS whitelist (
++                id VARCHAR(100) PRIMARY KEY NOT NULL,
++                note VARCHAR(300),
++                created_at DATETIME NOT NULL DEFAULT(current_timestamp)
++            ) WITHOUT ROWID",
++        )
++        .execute(self.pool.get().await?.deref_mut())
++        .await?;
++
+         Ok(())
+     }
+ 
+@@ -142,6 +176,65 @@ impl Database {
+         .await?;
+         Ok(())
+     }
++
++    pub async fn update_last_online(&self, guid: &[u8]) -> ResultType<()> {
++        sqlx::query("UPDATE peer SET last_online = current_timestamp WHERE guid = ?")
++            .bind(guid)
++            .execute(self.pool.get().await?.deref_mut())
++            .await?;
++        Ok(())
++    }
++
++    pub async fn set_peer_status(&self, id: &str, status: i64) -> ResultType<()> {
++        sqlx::query("UPDATE peer SET status = ? WHERE id = ?")
++            .bind(status)
++            .bind(id)
++            .execute(self.pool.get().await?.deref_mut())
++            .await?;
++        Ok(())
++    }
++
++    pub async fn list_peers(&self) -> ResultType<Vec<PeerListRecord>> {
++        Ok(sqlx::query_as::<_, PeerListRecord>(
++            "SELECT id, status, note, created_at, last_online, info FROM peer ORDER BY created_at DESC",
++        )
++        .fetch_all(self.pool.get().await?.deref_mut())
++        .await?)
++    }
++
++    pub async fn is_in_whitelist(&self, id: &str) -> ResultType<bool> {
++        let count: i64 =
++            sqlx::query_scalar("SELECT COUNT(*) FROM whitelist WHERE id = ?")
++                .bind(id)
++                .fetch_one(self.pool.get().await?.deref_mut())
++                .await?;
++        Ok(count > 0)
++    }
++
++    pub async fn add_to_whitelist(&self, id: &str, note: &str) -> ResultType<()> {
++        sqlx::query("INSERT OR REPLACE INTO whitelist(id, note) VALUES(?, ?)")
++            .bind(id)
++            .bind(note)
++            .execute(self.pool.get().await?.deref_mut())
++            .await?;
++        Ok(())
++    }
++
++    pub async fn remove_from_whitelist(&self, id: &str) -> ResultType<()> {
++        sqlx::query("DELETE FROM whitelist WHERE id = ?")
++            .bind(id)
++            .execute(self.pool.get().await?.deref_mut())
++            .await?;
++        Ok(())
++    }
++
++    pub async fn list_whitelist(&self) -> ResultType<Vec<WhitelistEntry>> {
++        Ok(sqlx::query_as::<_, WhitelistEntry>(
++            "SELECT id, note, created_at FROM whitelist ORDER BY created_at DESC",
++        )
++        .fetch_all(self.pool.get().await?.deref_mut())
++        .await?)
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/lib.rs b/src/lib.rs
+index 8da29a2..aaf3bc2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -4,3 +4,4 @@ pub mod common;
+ mod database;
+ mod peer;
+ mod version;
++pub(crate) mod api;
+diff --git a/src/peer.rs b/src/peer.rs
+index 4ca87cf..4ff459e 100644
+--- a/src/peer.rs
++++ b/src/peer.rs
+@@ -35,9 +35,8 @@ pub(crate) struct Peer {
+     pub(crate) guid: Vec<u8>,
+     pub(crate) uuid: Bytes,
+     pub(crate) pk: Bytes,
+-    // pub(crate) user: Option<Vec<u8>>,
+     pub(crate) info: PeerInfo,
+-    // pub(crate) disabled: bool,
++    pub(crate) disabled: bool,
+     pub(crate) reg_pk: (u32, Instant), // how often register_pk
+ }
+ 
+@@ -50,8 +49,7 @@ impl Default for Peer {
+             uuid: Bytes::new(),
+             pk: Bytes::new(),
+             info: Default::default(),
+-            // user: None,
+-            // disabled: false,
++            disabled: false,
+             reg_pk: (0, get_expired_time()),
+         }
+     }
+@@ -118,8 +116,9 @@ impl PeerMap {
+                     log::error!("db.insert_peer failed: {}", err);
+                     return register_pk_response::Result::SERVER_ERROR;
+                 }
+-                Ok(guid) => {
+-                    peer.write().await.guid = guid;
++                Ok(new_guid) => {
++                    let _ = self.db.update_last_online(&new_guid).await;
++                    peer.write().await.guid = new_guid;
+                 }
+             }
+         } else {
+@@ -127,6 +126,7 @@ impl PeerMap {
+                 log::error!("db.update_pk failed: {}", err);
+                 return register_pk_response::Result::SERVER_ERROR;
+             }
++            let _ = self.db.update_last_online(&guid).await;
+             log::info!("pk updated instead of insert");
+         }
+         register_pk_response::Result::OK
+@@ -142,9 +142,8 @@ impl PeerMap {
+                 guid: v.guid,
+                 uuid: v.uuid.into(),
+                 pk: v.pk.into(),
+-                // user: v.user,
+                 info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
+-                // disabled: v.status == Some(0),
++                disabled: v.status == Some(0),
+                 ..Default::default()
+             };
+             let peer = Arc::new(RwLock::new(peer));
+@@ -177,4 +176,26 @@ impl PeerMap {
+     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
+         self.map.read().await.contains_key(id)
+     }
++
++    // Evict peer from in-memory cache so that the next access reloads from DB.
++    // Call this after changing peer status in DB (disable/enable).
++    pub(crate) async fn evict(&self, id: &str) {
++        self.map.write().await.remove(id);
++    }
++
++    // Returns the set of peer IDs that are currently online (recently heartbeated).
++    pub(crate) async fn get_online_set(&self) -> HashSet<String> {
++        const REG_TIMEOUT_MS: u128 = 30_000;
++        let peers: Vec<(String, LockPeer)> = {
++            let map = self.map.read().await;
++            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
++        };
++        let mut online = HashSet::new();
++        for (id, peer) in peers {
++            if peer.read().await.last_reg_time.elapsed().as_millis() < REG_TIMEOUT_MS {
++                online.insert(id);
++            }
++        }
++        online
++    }
+ }
+diff --git a/src/rendezvous_server.rs b/src/rendezvous_server.rs
+index ff68441..4e1cd29 100644
+--- a/src/rendezvous_server.rs
++++ b/src/rendezvous_server.rs
+@@ -147,6 +147,18 @@ impl RendezvousServer {
+         log::info!("local-ip: {:?}", rs.inner.local_ip);
+         std::env::set_var("PORT_FOR_API", port.to_string());
+         rs.parse_relay_servers(&get_arg("relay-servers"));
++
++        // Management API server
++        {
++            let api_port = std::env::var("API_PORT")
++                .ok()
++                .and_then(|p| p.parse::<u16>().ok())
++                .unwrap_or((port + 3) as u16);
++            let pm_for_api = rs.pm.clone();
++            tokio::spawn(async move {
++                crate::api::start(pm_for_api, api_port).await;
++            });
++        }
+         let mut listener = create_tcp_listener(port).await?;
+         let mut listener2 = create_tcp_listener(nat_port).await?;
+         let mut listener3 = create_tcp_listener(ws_port).await?;
+@@ -350,7 +362,33 @@ impl RendezvousServer {
+                     } else if !self.check_ip_blocker(&ip, &id).await {
+                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
+                     }
++
++                    // Whitelist enforcement (opt-in via ENABLE_WHITELIST=Y)
++                    if std::env::var("ENABLE_WHITELIST")
++                        .unwrap_or_default()
++                        .to_uppercase()
++                        == "Y"
++                    {
++                        match self.pm.db.is_in_whitelist(&id).await {
++                            Ok(false) => {
++                                log::warn!("RegisterPk rejected: {} not in whitelist", id);
++                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
++                            }
++                            Err(e) => {
++                                log::error!("Whitelist check error: {}", e);
++                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
++                            }
++                            _ => {}
++                        }
++                    }
++
+                     let peer = self.pm.get_or(&id).await;
++
++                    // Disabled check
++                    if peer.read().await.disabled {
++                        log::warn!("RegisterPk rejected: {} is disabled", id);
++                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
++                    }
+                     let (changed, ip_changed) = {
+                         let peer = peer.read().await;
+                         if peer.uuid.is_empty() {
+-- 
+2.43.0
+

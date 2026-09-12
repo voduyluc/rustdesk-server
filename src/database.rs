@@ -4,6 +4,23 @@ use sqlx::{
     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
 };
 use std::{ops::DerefMut, str::FromStr};
+
+#[derive(Default, sqlx::FromRow)]
+pub struct WhitelistEntry {
+    pub id: String,
+    pub note: Option<String>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Default, sqlx::FromRow)]
+pub struct PeerListRecord {
+    pub id: String,
+    pub status: Option<i64>,
+    pub note: Option<String>,
+    pub created_at: Option<String>,
+    pub last_online: Option<String>,
+    pub info: String,
+}
 //use sqlx::postgres::PgPoolOptions;
 //use sqlx::mysql::MySqlPoolOptions;
 
@@ -90,6 +107,23 @@ impl Database {
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
+
+        // Migrate: add last_online column if not already present
+        let _ = sqlx::query("ALTER TABLE peer ADD COLUMN last_online DATETIME")
+            .execute(self.pool.get().await?.deref_mut())
+            .await;
+
+        // Whitelist table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS whitelist (
+                id VARCHAR(100) PRIMARY KEY NOT NULL,
+                note VARCHAR(300),
+                created_at DATETIME NOT NULL DEFAULT(current_timestamp)
+            ) WITHOUT ROWID",
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+
         Ok(())
     }
 
@@ -141,6 +175,65 @@ impl Database {
         .execute(self.pool.get().await?.deref_mut())
         .await?;
         Ok(())
+    }
+
+    pub async fn update_last_online(&self, guid: &[u8]) -> ResultType<()> {
+        sqlx::query("UPDATE peer SET last_online = current_timestamp WHERE guid = ?")
+            .bind(guid)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_peer_status(&self, id: &str, status: i64) -> ResultType<()> {
+        sqlx::query("UPDATE peer SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_peers(&self) -> ResultType<Vec<PeerListRecord>> {
+        Ok(sqlx::query_as::<_, PeerListRecord>(
+            "SELECT id, status, note, created_at, last_online, info FROM peer ORDER BY created_at DESC",
+        )
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
+    pub async fn is_in_whitelist(&self, id: &str) -> ResultType<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM whitelist WHERE id = ?")
+                .bind(id)
+                .fetch_one(self.pool.get().await?.deref_mut())
+                .await?;
+        Ok(count > 0)
+    }
+
+    pub async fn add_to_whitelist(&self, id: &str, note: &str) -> ResultType<()> {
+        sqlx::query("INSERT OR REPLACE INTO whitelist(id, note) VALUES(?, ?)")
+            .bind(id)
+            .bind(note)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn remove_from_whitelist(&self, id: &str) -> ResultType<()> {
+        sqlx::query("DELETE FROM whitelist WHERE id = ?")
+            .bind(id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_whitelist(&self) -> ResultType<Vec<WhitelistEntry>> {
+        Ok(sqlx::query_as::<_, WhitelistEntry>(
+            "SELECT id, note, created_at FROM whitelist ORDER BY created_at DESC",
+        )
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
     }
 }
 
